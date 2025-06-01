@@ -44,7 +44,7 @@ fn run(aslr_reference: usize) -> Result<()> {
 
         server.read_exact(&mut buffer[..n])?;
 
-        let patch: JumpTable = bincode::deserialize(&buffer[..n])?;
+        let patch: JumpTable = bincode::serde::decode_from_slice(&buffer, bincode::config::standard())?.0;
 
         unsafe {
             subsecond::apply_patch(patch)?;

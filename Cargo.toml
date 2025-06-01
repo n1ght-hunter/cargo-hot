@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 ar = "0.9"
-bincode = "1"
+bincode = { version = "2", features = ["serde"] }
 cargo = "0.88"
 cargo-config2 = "0.1"
 cargo_metadata = "0.20"
