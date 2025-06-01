@@ -30,7 +30,7 @@ pub fn inject() {
 fn run(aslr_reference: usize) -> Result<()> {
     let mut server = net::TcpStream::connect("127.0.0.1:1100")?;
 
-    server.write_all(&usize::to_be_bytes(aslr_reference))?;
+    server.write_all(&aslr_reference.to_be_bytes())?;
     server.flush()?;
 
     let mut size = [0; std::mem::size_of::<usize>()];
