@@ -17,6 +17,7 @@ use tokio::process;
 use tokio::sync::mpsc;
 
 use std::collections::BTreeSet;
+use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,7 +35,9 @@ async fn main() -> Result<()> {
     let gctx = GlobalContext::default()?;
 
     let _token = cargo::util::job::setup();
-    let args = command().try_get_matches()?;
+
+    // TODO: Get rid of this terrible hack
+    let args = command().try_get_matches_from(env::args_os().filter(|arg| arg != "hot"))?;
 
     let ws = args.workspace(&gctx)?;
     let server = Server::new(&gctx, ws, &args).await?;
@@ -101,8 +104,8 @@ pub struct Build {
     pub(crate) exe: PathBuf,
     pub(crate) direct_rustc: rustc::Args,
     pub(crate) time_start: SystemTime,
-    pub(crate) time_end: SystemTime,
-    pub(crate) mode: BuildMode,
+    // pub(crate) time_end: SystemTime,
+    // pub(crate) mode: BuildMode,
     pub(crate) patch_cache: Option<Arc<hotpatch::Cache>>,
 }
 
@@ -449,14 +452,14 @@ impl Server {
         let mut output_location: Option<PathBuf> = None;
         let mut stdout = stdout.lines();
         let mut stderr = stderr.lines();
-        let mut emitting_error = false;
+        // let mut emitting_error = false;
 
         // TODO
         // let mut units_compiled = 0;
 
         loop {
             use cargo_metadata::Message;
-            use cargo_metadata::diagnostic::Diagnostic;
+            // use cargo_metadata::diagnostic::Diagnostic;
 
             let line = tokio::select! {
                 Ok(Some(line)) = stdout.next_line() => line,
@@ -496,9 +499,9 @@ impl Server {
                     }
 
                     // Handle direct rustc diagnostics
-                    if let Ok(diag) = serde_json::from_str::<Diagnostic>(&line) {
-                        eprintln!("{diag}");
-                    }
+                    // if let Ok(diag) = serde_json::from_str::<Diagnostic>(&line) {
+                    //     // eprintln!("{diag}");
+                    // }
 
                     // For whatever reason, if there's an error while building, we still receive the TextLine
                     // instead of an "error" message. However, the following messages *also* tend to
@@ -509,15 +512,15 @@ impl Server {
                     // into a more reliable way to detect errors propagating out of the compiler. If
                     // we always wrapped rustc, then we could store this data somewhere in a much more
                     // reliable format.
-                    if line.trim_start().starts_with("error:") {
-                        emitting_error = true;
-                    }
+                    // if line.trim_start().starts_with("error:") {
+                    //     emitting_error = true;
+                    // }
 
-                    // Note that previous text lines might have set emitting_error to true
-                    match emitting_error {
-                        true => eprintln!("{line}"),
-                        false => println!("{line}"),
-                    }
+                    // // Note that previous text lines might have set emitting_error to true
+                    // match emitting_error {
+                    //     true => eprintln!("{line}"),
+                    //     false => println!("{line}"),
+                    // }
                 }
                 Message::CompilerArtifact(artifact) => {
                     // TODO
@@ -584,7 +587,7 @@ impl Server {
         // let assets = self.collect_assets(&exe, ctx)?;
 
         let time_end = SystemTime::now();
-        let mode = mode.clone();
+        // let mode = mode.clone();
 
         log::debug!(
             "Build completed successfully in {}us: {:?}",
@@ -593,11 +596,11 @@ impl Server {
         );
 
         Ok(Build {
-            time_end,
+            // time_end,
             exe,
             direct_rustc,
             time_start,
-            mode,
+            // mode,
             patch_cache: None,
         })
     }
