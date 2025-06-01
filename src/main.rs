@@ -1,8 +1,8 @@
-mod hotpatch;
-mod link;
-mod rustc;
-
-use crate::link::LinkerFlavor;
+use cargo_hot::Result;
+use cargo_hot::hotpatch;
+use cargo_hot::link::{self, LinkerFlavor};
+use cargo_hot::rustc;
+use cargo_hot::server;
 
 use cargo::GlobalContext;
 use cargo::core::{Target, TargetKind, Workspace};
@@ -14,16 +14,18 @@ use serde::Deserialize;
 use target_lexicon::{Architecture, OperatingSystem, Triple};
 use tempfile::NamedTempFile;
 use tokio::process;
+use tokio::sync::mpsc;
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
-
-pub type Result<T> = anyhow::Result<T>;
+use std::time::{Duration, SystemTime};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     if rustc::is_wrapping_rustc() {
         rustc::run_rustc().await;
         return Ok(());
@@ -35,11 +37,9 @@ async fn main() -> Result<()> {
     let args = command().try_get_matches()?;
 
     let ws = args.workspace(&gctx)?;
-
     let server = Server::new(&gctx, ws, &args).await?;
-    server.build(BuildMode::Fat).await?;
 
-    Ok(())
+    server.run().await
 }
 
 fn command() -> Command {
@@ -152,8 +152,8 @@ impl Server {
             .cloned()
             .or(args.get_one("bin").cloned())
             .or_else(|| {
-                if let Some(default_run) = &workspace.default_members().next() {
-                    return Some(default_run.name().to_string());
+                if let Some(default_run) = &main_package.manifest().default_run() {
+                    return Some(default_run.to_string());
                 }
 
                 let bin_count = packages
@@ -208,7 +208,7 @@ impl Server {
 
         let profile = match args.get_one::<String>("profile") {
             Some(profile) => profile.to_owned(),
-            None if args.contains_id("release") => "release".to_string(),
+            None if args.flag("release") => "release".to_string(),
             None => "dev".to_string(),
         };
 
@@ -225,8 +225,6 @@ impl Server {
             .unwrap_or_else(|| main_package.name().to_string());
 
         let cargo_config = cargo_config2::Config::load().unwrap();
-
-        dbg!(&cargo_config);
 
         let target_dir = std::env::var("CARGO_TARGET_DIR")
             .ok()
@@ -281,6 +279,87 @@ impl Server {
             link_err_file,
             rustc_wrapper_args_file,
         })
+    }
+
+    async fn run(self) -> Result<()> {
+        use notify::Watcher;
+
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = sender.blocking_send(event);
+        })?;
+
+        let build = self.build(BuildMode::Fat).await?;
+
+        let _ = tokio::process::Command::new(self.main_exe()).spawn()?;
+
+        watcher.watch(
+            self.crate_target
+                .src_path()
+                .path()
+                .and_then(|path| path.parent())
+                .expect("Get source path"),
+            notify::RecursiveMode::Recursive,
+        )?;
+
+        let mut server = server::Server::bind().await?;
+        let mut connection = server.accept().await?;
+        let mut buffer = Vec::new();
+
+        loop {
+            let n = read_batch(&mut receiver, &mut buffer, Duration::from_millis(100)).await;
+
+            if n == 0 {
+                break;
+            }
+
+            let changed_files: BTreeSet<PathBuf> = buffer
+                .drain(..n)
+                .filter_map(|event| {
+                    let event = event.ok()?;
+
+                    let notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) = event.kind
+                    else {
+                        return None;
+                    };
+
+                    let Some(path) = event.paths.first() else {
+                        return None;
+                    };
+
+                    if path != &path.with_extension("rs") {
+                        return None;
+                    }
+
+                    Some(event.paths)
+                })
+                .flatten()
+                .collect();
+
+            if changed_files.is_empty() {
+                continue;
+            }
+
+            let patch = self
+                .build(BuildMode::Thin {
+                    rustc_args: build.direct_rustc.clone(),
+                    changed_files: changed_files.into_iter().collect(),
+                    aslr_reference: connection.aslr_reference() as u64,
+                    cache: build.patch_cache.clone().unwrap(),
+                })
+                .await?;
+
+            let jump_table = hotpatch::create_jump_table(
+                &self.patch_exe(patch.time_start),
+                &self.triple,
+                build.patch_cache.as_ref().unwrap(),
+            )?;
+
+            connection.patch(&jump_table).await?;
+        }
+
+        Ok(())
     }
 
     async fn build(&self, mode: BuildMode) -> Result<Build> {
@@ -1652,4 +1731,31 @@ fn path_to_me() -> Result<PathBuf> {
         dunce::canonicalize(std::env::current_exe().context("Failed to find cargo-hot")?)
             .context("Failed to find cargo-hot")?,
     )
+}
+
+async fn read_batch<T>(
+    receiver: &mut mpsc::Receiver<T>,
+    buffer: &mut Vec<T>,
+    duration: Duration,
+) -> usize {
+    use tokio::time;
+
+    let Some(item) = receiver.recv().await else {
+        return 0;
+    };
+
+    buffer.push(item);
+
+    let mut n = 1;
+
+    loop {
+        let Ok(Some(item)) = time::timeout(duration, receiver.recv()).await else {
+            break;
+        };
+
+        buffer.push(item);
+        n += 1;
+    }
+
+    return n;
 }

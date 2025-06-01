@@ -81,7 +81,7 @@ impl LinkAction {
         })
     }
 
-    pub(crate) fn write_env_vars(&self, env_vars: &mut Vec<(&str, String)>) -> Result<()> {
+    pub fn write_env_vars(&self, env_vars: &mut Vec<(&str, String)>) -> Result<()> {
         env_vars.push((Self::DX_LINK_ARG, "1".to_string()));
         env_vars.push((
             Self::DX_ARGS_FILE,
