@@ -12,6 +12,8 @@ use std::net;
 use std::thread;
 use std::time::Duration;
 
+/// Injects the hotpatch server into the current process.
+/// This function will spawn a thread that connects to the hotpatch server and applies patches as they are received.
 pub fn inject() {
     let aslr_reference = subsecond::aslr_reference();
 
@@ -37,6 +39,7 @@ fn run(aslr_reference: usize) -> Result<()> {
     let mut buffer = Vec::new();
 
     loop {
+        // Read the size of the patch   
         server.read_exact(&mut size)?;
 
         let n = usize::from_be_bytes(size);
@@ -44,6 +47,7 @@ fn run(aslr_reference: usize) -> Result<()> {
 
         server.read_exact(&mut buffer[..n])?;
 
+        // Deserialize the patch
         let patch: JumpTable = bincode::serde::decode_from_slice(&buffer, bincode::config::standard())?.0;
 
         unsafe {
