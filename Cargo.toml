@@ -16,7 +16,6 @@ clap = "4.5"
 color-print = "0.3"
 dunce = "1"
 itertools = "0.14"
-log = "0.4"
 notify = "8"
 pdb = "0.8"
 rayon = "1.10"
@@ -44,6 +43,7 @@ uuid.features = ["v5"]
 
 walrus.version = "0.23"
 walrus.features = ["parallel"]
+tracing = "0.1.41"
 
 [workspace]
 members = ["example"]

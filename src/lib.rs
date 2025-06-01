@@ -19,7 +19,7 @@ pub fn inject() {
     thread::spawn(move || {
         loop {
             if let Err(error) = run(aslr_reference) {
-                log::error!("connection lost: {error}");
+                tracing::error!("connection lost: {error}");
             }
 
             thread::sleep(Duration::from_secs(1));

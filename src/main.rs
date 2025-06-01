@@ -402,7 +402,7 @@ impl Server {
                 //     .await
                 //     .context("Failed to assemble app bundle")?;
 
-                log::debug!("Binary created at {}", self.build_dir().display());
+                tracing::debug!("Binary created at {}", self.build_dir().display());
             }
         }
 
@@ -439,7 +439,7 @@ impl Server {
         let time_start = SystemTime::now();
         let mut cmd = self.build_command(mode)?;
 
-        log::debug!("Executing cargo for {}", self.triple);
+        tracing::debug!("Executing cargo for {}", self.triple);
 
         let mut child = cmd
             .stdout(std::process::Stdio::piped())
@@ -553,9 +553,9 @@ impl Server {
         if let Ok(linker_warnings) = std::fs::read_to_string(self.link_err_file.path()) {
             if !linker_warnings.is_empty() {
                 if output_location.is_none() {
-                    log::error!("Linker warnings: {}", linker_warnings);
+                    tracing::error!("Linker warnings: {}", linker_warnings);
                 } else {
-                    log::debug!("Linker warnings: {}", linker_warnings);
+                    tracing::debug!("Linker warnings: {}", linker_warnings);
                 }
             }
         }
@@ -574,7 +574,7 @@ impl Server {
             let link_start = SystemTime::now();
             self.run_fat_link(&exe, &direct_rustc).await?;
 
-            log::debug!(
+            tracing::debug!(
                 "Fat linking completed in {}us",
                 SystemTime::now()
                     .duration_since(link_start)
@@ -589,7 +589,7 @@ impl Server {
         let time_end = SystemTime::now();
         // let mode = mode.clone();
 
-        log::debug!(
+        tracing::debug!(
             "Build completed successfully in {}us: {:?}",
             time_end.duration_since(time_start).unwrap().as_micros(),
             exe
@@ -612,7 +612,7 @@ impl Server {
         cache: &Arc<hotpatch::Cache>,
         rustc_args: &rustc::Args,
     ) -> anyhow::Result<()> {
-        log::debug!(
+        tracing::debug!(
             "Original builds for patch: {}",
             self.link_args_file.path().display()
         );
@@ -729,7 +729,7 @@ impl Server {
             _ => vec!["-o".to_string(), out_exe.display().to_string()],
         };
 
-        log::trace!("Linking with {:?} using args: {:#?}", linker, object_files);
+        tracing::trace!("Linking with {:?} using args: {:#?}", linker, object_files);
 
         // Run the linker directly!
         //
@@ -748,9 +748,9 @@ impl Server {
         if !res.stderr.is_empty() {
             let errs = String::from_utf8_lossy(&res.stderr);
             if !self.patch_exe(build.time_start).exists() || !res.status.success() {
-                log::error!("Failed to generate patch: {}", errs.trim());
+                tracing::error!("Failed to generate patch: {}", errs.trim());
             } else {
-                log::trace!("Linker output during thin linking: {}", errs.trim());
+                tracing::trace!("Linker output during thin linking: {}", errs.trim());
             }
         }
 
@@ -1106,11 +1106,11 @@ impl Server {
                 // if the rlib is not in the target directory, we skip it.
                 if !rlib.starts_with(&self.workspace_dir) {
                     compiler_rlibs.push(rlib.clone());
-                    log::trace!("Skipping rlib: {:?}", rlib);
+                    tracing::trace!("Skipping rlib: {:?}", rlib);
                     continue;
                 }
 
-                log::trace!("Adding rlib to staticlib: {:?}", rlib);
+                tracing::trace!("Adding rlib to staticlib: {:?}", rlib);
 
                 let rlib_contents = std::fs::read(rlib)?;
                 let mut reader = ar::Archive::new(std::io::Cursor::new(rlib_contents));
@@ -1135,7 +1135,7 @@ impl Server {
                     }
 
                     if !(name.ends_with(".o") || name.ends_with(".obj")) {
-                        log::debug!("Unknown object file in rlib: {:?}", name);
+                        tracing::debug!("Unknown object file in rlib: {:?}", name);
                     }
 
                     archive_has_contents = true;
@@ -1147,7 +1147,7 @@ impl Server {
 
             let bytes = out_ar.into_inner().context("Failed to finalize archive")?;
             std::fs::write(&out_ar_path, bytes).context("Failed to write archive")?;
-            log::debug!("Wrote fat archive to {:?}", out_ar_path);
+            tracing::debug!("Wrote fat archive to {:?}", out_ar_path);
 
             // Run the ranlib command to index the archive. This slows down this process a bit,
             // but is necessary for some linkers to work properly.
@@ -1209,7 +1209,7 @@ impl Server {
                         }
                     }
                     LinkerFlavor::Unsupported => {
-                        log::error!("Unsupported platform for fat linking");
+                        tracing::error!("Unsupported platform for fat linking");
                     }
                 };
             }
@@ -1261,8 +1261,8 @@ impl Server {
         // And now we can run the linker with our new args
         let linker = self.select_linker()?;
 
-        log::trace!("Fat linking with args: {:?} {:#?}", linker, args);
-        log::trace!("Fat linking with env: {:#?}", rustc_args.envs);
+        tracing::trace!("Fat linking with args: {:?} {:#?}", linker, args);
+        tracing::trace!("Fat linking with env: {:#?}", rustc_args.envs);
 
         // Run the linker directly!
         let out_arg = match self.triple.operating_system {
@@ -1281,15 +1281,15 @@ impl Server {
         if !res.stderr.is_empty() {
             let errs = String::from_utf8_lossy(&res.stderr);
             if !res.status.success() {
-                log::error!("Failed to generate fat binary: {}", errs.trim());
+                tracing::error!("Failed to generate fat binary: {}", errs.trim());
             } else {
-                log::trace!("Warnings during fat linking: {}", errs.trim());
+                tracing::trace!("Warnings during fat linking: {}", errs.trim());
             }
         }
 
         if !res.stdout.is_empty() {
             let out = String::from_utf8_lossy(&res.stdout);
-            log::trace!("Output from fat linking: {}", out.trim());
+            tracing::trace!("Output from fat linking: {}", out.trim());
         }
 
         // Clean up the temps manually
@@ -1471,7 +1471,7 @@ impl Server {
                 //     cmd.arg("-Crelocation-model=pic");
                 // }
 
-                log::debug!("Direct rustc: {:#?}", cmd);
+                tracing::debug!("Direct rustc: {:#?}", cmd);
 
                 cmd.envs(rustc_args.envs.iter().cloned());
 
@@ -1511,7 +1511,7 @@ impl Server {
                     cmd.env("RUSTC_WRAPPER", path_to_me()?.display().to_string());
                 }
 
-                log::debug!("Cargo: {:#?}", cmd);
+                tracing::debug!("Cargo: {:#?}", cmd);
 
                 Ok(cmd)
             }

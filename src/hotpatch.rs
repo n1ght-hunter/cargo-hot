@@ -452,7 +452,7 @@ fn create_wasm_jump_table(patch: &Path, cache: &Cache) -> Result<JumpTable> {
             "GOT.mem" => got_mems.push(import.id()),
             "env" => env_funcs.push(import.id()),
             "__wbindgen_placeholder__" => wbg_funcs.push(import.id()),
-            m => log::trace!("Unknown import: {m}:{}", import.name),
+            m => tracing::trace!("Unknown import: {m}:{}", import.name),
         }
     }
 
@@ -767,7 +767,7 @@ pub fn create_undefined_symbol_stub(
         .cloned()
         .collect();
 
-    log::trace!("Undefined symbols: {:#?}", undefined_symbols);
+    tracing::trace!("Undefined symbols: {:#?}", undefined_symbols);
 
     // Create a new object file (architecture doesn't matter much for our purposes)
     let mut obj = object::write::Object::new(
@@ -844,7 +844,7 @@ pub fn create_undefined_symbol_stub(
             .symbol_table
             .get(name.as_str().trim_start_matches("__imp_"))
         else {
-            log::debug!("Symbol not found: {}", name);
+            tracing::debug!("Symbol not found: {}", name);
             continue;
         };
 
@@ -1332,7 +1332,7 @@ fn parse_bytes_to_data_segment(bytes: &[u8]) -> Result<RawDataSection> {
                 }
             }
             Payload::CustomSection(section) => {
-                log::trace!("Skipping Custom section: {:?}", section.name());
+                tracing::trace!("Skipping Custom section: {:?}", section.name());
             }
             _ => {}
         }
