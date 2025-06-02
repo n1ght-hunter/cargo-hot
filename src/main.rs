@@ -2,17 +2,16 @@ use cargo_hot::Result;
 use cargo_hot::hotpatch;
 use cargo_hot::link::{self, LinkerFlavor};
 use cargo_hot::rustc;
-use cargo_hot::server;
+use cargo_hot_protocol::server;
 
 use cargo::GlobalContext;
 use cargo::core::{Target, TargetKind, Workspace};
 use cargo::util::{Filesystem, command_prelude::*};
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use itertools::Itertools;
 use serde::Deserialize;
 use target_lexicon::{Architecture, OperatingSystem, Triple};
-use tempfile::NamedTempFile;
 use tokio::process;
 use tokio::sync::mpsc;
 
@@ -25,6 +24,7 @@ use std::time::{Duration, SystemTime};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(debug_assertions)]
     tracing_subscriber::fmt::init();
 
     if rustc::is_wrapping_rustc() {
@@ -33,11 +33,16 @@ async fn main() -> Result<()> {
     }
 
     let gctx = GlobalContext::default()?;
-
     let _token = cargo::util::job::setup();
 
-    // TODO: Get rid of this terrible hack
-    let args = command().try_get_matches_from(env::args_os().filter(|arg| arg != "hot"))?;
+    let matches = Command::new("cargo")
+        .bin_name("cargo")
+        .subcommand(command())
+        .try_get_matches()?;
+
+    let (_, args) = matches
+        .subcommand()
+        .ok_or(anyhow!("`cargo-hot` must be called with `hot` subcommand"))?;
 
     let ws = args.workspace(&gctx)?;
     let server = Server::new(&gctx, ws, &args).await?;
@@ -94,19 +99,14 @@ pub struct Server {
     no_default_features: bool,
     target_dir: Filesystem,
     custom_linker: Option<PathBuf>,
-    link_args_file: Arc<NamedTempFile>,
-    link_err_file: Arc<NamedTempFile>,
-    rustc_wrapper_args_file: Arc<NamedTempFile>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Build {
-    pub(crate) exe: PathBuf,
-    pub(crate) direct_rustc: rustc::Args,
-    pub(crate) time_start: SystemTime,
-    // pub(crate) time_end: SystemTime,
-    // pub(crate) mode: BuildMode,
-    pub(crate) patch_cache: Option<Arc<hotpatch::Cache>>,
+    exe: PathBuf,
+    direct_rustc: rustc::Args,
+    time_start: SystemTime,
+    patch_cache: Option<Arc<hotpatch::Cache>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -195,6 +195,7 @@ impl Server {
                 }).collect::<Vec<_>>();
 
                 filtered_packages.join(", ")};
+
                 if let Some(example) = &args.get_one::<String>("example"){
                     let examples = target_of_kind(&TargetKind::ExampleBin);
                     format!("Failed to find example {example}. \nAvailable examples are:\n{}", examples)
@@ -237,24 +238,9 @@ impl Server {
             .unwrap_or_else(|| workspace.target_dir());
 
         let custom_linker = cargo_config.linker(triple.to_string())?;
-
-        let link_args_file = Arc::new(
-            NamedTempFile::with_suffix(".txt")
-                .context("Failed to create temporary file for linker args")?,
-        );
-
-        let link_err_file = Arc::new(
-            NamedTempFile::with_suffix(".txt")
-                .context("Failed to create temporary file for linker args")?,
-        );
-
-        let rustc_wrapper_args_file = Arc::new(
-            NamedTempFile::with_suffix(".json")
-                .context("Failed to create temporary file for rustc wrapper args")?,
-        );
-
         let extra_cargo_args = vec![]; // TODO
 
+        // TODO
         let extra_rustc_args = cargo_config
             .rustflags(triple.to_string())
             .unwrap_or_default()
@@ -278,14 +264,25 @@ impl Server {
             no_default_features: args.get_flag("no-default-features"),
             target_dir,
             custom_linker,
-            link_args_file,
-            link_err_file,
-            rustc_wrapper_args_file,
         })
     }
 
     async fn run(self) -> Result<()> {
         use notify::Watcher;
+
+        std::fs::create_dir_all(self.exe_dir())?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(self.link_args_file())?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(self.link_err_file())?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(self.rustc_wrapper_args_file())?;
 
         let (sender, mut receiver) = mpsc::channel(1);
 
@@ -294,7 +291,6 @@ impl Server {
         })?;
 
         let build = self.build(BuildMode::Fat).await?;
-
         let _ = tokio::process::Command::new(self.main_exe()).spawn()?;
 
         watcher.watch(
@@ -344,33 +340,15 @@ impl Server {
                 continue;
             }
 
-            let patch = self
-                .build(BuildMode::Thin {
-                    rustc_args: build.direct_rustc.clone(),
-                    changed_files: changed_files.into_iter().collect(),
-                    aslr_reference: connection.aslr_reference() as u64,
-                    cache: build.patch_cache.clone().unwrap(),
-                })
-                .await?;
-
-            let jump_table = hotpatch::create_jump_table(
-                &self.patch_exe(patch.time_start),
-                &self.triple,
-                build.patch_cache.as_ref().unwrap(),
-            )?;
-
-            connection.patch(&jump_table).await?;
+            if let Err(error) = self.patch(&build, changed_files, &mut connection).await {
+                tracing::error!("{error}");
+            }
         }
 
         Ok(())
     }
 
     async fn build(&self, mode: BuildMode) -> Result<Build> {
-        // TODO?
-        // If we forget to do this, then we won't get the linker args since rust skips the full build
-        // We need to make sure to not react to this though, so the filemap must cache it
-        // _ = self.bust_fingerprint(&mode);
-
         // Run the cargo build to produce our artifacts
         let mut build = self.cargo_build(&mode).await?;
 
@@ -391,17 +369,6 @@ impl Server {
                     .await
                     .context("Failed to write main executable")?;
 
-                // TODO
-                // self.write_metadata().await?;
-
-                // TODO
-                // self.optimize().await?;
-
-                // TODO
-                // self.assemble()
-                //     .await
-                //     .context("Failed to assemble app bundle")?;
-
                 tracing::debug!("Binary created at {}", self.build_dir().display());
             }
         }
@@ -414,6 +381,32 @@ impl Server {
         Ok(build)
     }
 
+    async fn patch(
+        &self,
+        build: &Build,
+        changed_files: BTreeSet<PathBuf>,
+        connection: &mut server::Connection,
+    ) -> Result<()> {
+        let patch = self
+            .build(BuildMode::Thin {
+                rustc_args: build.direct_rustc.clone(),
+                changed_files: changed_files.into_iter().collect(),
+                aslr_reference: connection.aslr_reference() as u64,
+                cache: build.patch_cache.clone().unwrap(),
+            })
+            .await?;
+
+        let jump_table = hotpatch::create_jump_table(
+            &self.patch_exe(patch.time_start),
+            &self.triple,
+            build.patch_cache.as_ref().unwrap(),
+        )?;
+
+        connection.patch(&jump_table).await?;
+
+        Ok(())
+    }
+
     async fn create_patch_cache(&self, exe: &Path) -> Result<hotpatch::Cache> {
         // TODO: Wasm
         let exe = exe.to_path_buf();
@@ -423,7 +416,6 @@ impl Server {
 
     async fn write_executable(&self, exe: &Path) -> Result<()> {
         // TODO: Wasm
-        std::fs::create_dir_all(self.exe_dir())?;
         std::fs::copy(exe, self.main_exe())?;
 
         Ok(())
@@ -452,14 +444,15 @@ impl Server {
         let mut output_location: Option<PathBuf> = None;
         let mut stdout = stdout.lines();
         let mut stderr = stderr.lines();
-        // let mut emitting_error = false;
+        let mut emitting_error = false;
+        let mut has_compiled = false;
 
         // TODO
         // let mut units_compiled = 0;
 
         loop {
             use cargo_metadata::Message;
-            // use cargo_metadata::diagnostic::Diagnostic;
+            use cargo_metadata::diagnostic::Diagnostic;
 
             let line = tokio::select! {
                 Ok(Some(line)) = stdout.next_line() => line,
@@ -476,7 +469,7 @@ impl Server {
                     // TODO
                     // units_compiled += 1;
                 }
-                Message::CompilerMessage(msg) => eprintln!("{}", msg.message),
+                Message::CompilerMessage(msg) => println!("{}", msg.message),
                 Message::TextLine(line) => {
                     // Handle the case where we're getting lines directly from rustc.
                     // These are in a different format than the normal cargo output, though I imagine
@@ -496,12 +489,18 @@ impl Server {
                         if artifact.emit == "link" {
                             output_location = Some(artifact.artifact);
                         }
+
+                        continue;
                     }
 
                     // Handle direct rustc diagnostics
-                    // if let Ok(diag) = serde_json::from_str::<Diagnostic>(&line) {
-                    //     // eprintln!("{diag}");
-                    // }
+                    if let Ok(diag) = serde_json::from_str::<Diagnostic>(&line) {
+                        if let Some(rendered) = diag.rendered {
+                            println!("{}", rendered);
+                        }
+
+                        continue;
+                    }
 
                     // For whatever reason, if there's an error while building, we still receive the TextLine
                     // instead of an "error" message. However, the following messages *also* tend to
@@ -512,19 +511,20 @@ impl Server {
                     // into a more reliable way to detect errors propagating out of the compiler. If
                     // we always wrapped rustc, then we could store this data somewhere in a much more
                     // reliable format.
-                    // if line.trim_start().starts_with("error:") {
-                    //     emitting_error = true;
-                    // }
+                    if line.trim_start().starts_with("error:") {
+                        emitting_error = true;
+                    }
 
-                    // // Note that previous text lines might have set emitting_error to true
-                    // match emitting_error {
-                    //     true => eprintln!("{line}"),
-                    //     false => println!("{line}"),
-                    // }
+                    // Note that previous text lines might have set emitting_error to true
+                    match emitting_error {
+                        true => eprintln!("{line}"),
+                        false => println!("{line}"),
+                    }
                 }
                 Message::CompilerArtifact(artifact) => {
                     // TODO
                     // units_compiled += 1;
+                    has_compiled = has_compiled || !artifact.fresh;
                     output_location = artifact.executable.map(Into::into);
                 }
                 // todo: this can occasionally swallow errors, so we should figure out what exactly is going wrong
@@ -543,14 +543,14 @@ impl Server {
 
         // Accumulate the rustc args from the wrapper, if they exist and can be parsed.
         let mut direct_rustc = rustc::Args::default();
-        if let Ok(res) = std::fs::read_to_string(self.rustc_wrapper_args_file.path()) {
+        if let Ok(res) = std::fs::read_to_string(self.rustc_wrapper_args_file()) {
             if let Ok(res) = serde_json::from_str(&res) {
                 direct_rustc = res;
             }
         }
 
         // If there's any warnings from the linker, we should print them out
-        if let Ok(linker_warnings) = std::fs::read_to_string(self.link_err_file.path()) {
+        if let Ok(linker_warnings) = std::fs::read_to_string(self.link_err_file()) {
             if !linker_warnings.is_empty() {
                 if output_location.is_none() {
                     tracing::error!("Linker warnings: {}", linker_warnings);
@@ -561,7 +561,7 @@ impl Server {
         }
 
         // Collect the linker args from the and update the rustc args
-        direct_rustc.link_args = std::fs::read_to_string(self.link_args_file.path())
+        direct_rustc.link_args = std::fs::read_to_string(self.link_args_file())
             .context("Failed to read link args from file")?
             .lines()
             .map(|s| s.to_string())
@@ -570,7 +570,7 @@ impl Server {
         let exe = output_location.context("Cargo build failed - no output location. Toggle tracing mode (press `t`) for more information.")?;
 
         // Fat builds need to be linked with the fat linker. Would also like to link here for thin builds
-        if matches!(mode, BuildMode::Fat) {
+        if matches!(mode, BuildMode::Fat) && has_compiled {
             let link_start = SystemTime::now();
             self.run_fat_link(&exe, &direct_rustc).await?;
 
@@ -583,11 +583,7 @@ impl Server {
             );
         }
 
-        // TODO?
-        // let assets = self.collect_assets(&exe, ctx)?;
-
         let time_end = SystemTime::now();
-        // let mode = mode.clone();
 
         tracing::debug!(
             "Build completed successfully in {}us: {:?}",
@@ -596,11 +592,9 @@ impl Server {
         );
 
         Ok(Build {
-            // time_end,
             exe,
             direct_rustc,
             time_start,
-            // mode,
             patch_cache: None,
         })
     }
@@ -614,10 +608,10 @@ impl Server {
     ) -> anyhow::Result<()> {
         tracing::debug!(
             "Original builds for patch: {}",
-            self.link_args_file.path().display()
+            self.link_args_file().display()
         );
 
-        let raw_args = std::fs::read_to_string(self.link_args_file.path())
+        let raw_args = std::fs::read_to_string(self.link_args_file())
             .context("Failed to read link args from file")?;
 
         let args = raw_args.lines().collect::<Vec<_>>();
@@ -996,9 +990,7 @@ impl Server {
     }
 
     fn internal_out_dir(&self) -> PathBuf {
-        let dir = self.target_dir.as_path_unlocked().join("cargo-hot");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        self.target_dir.as_path_unlocked().join("cargo-hot")
     }
 
     /// When we link together the fat binary, we need to make sure every `.o` file in *every* rlib
@@ -1169,6 +1161,7 @@ impl Server {
         //
         // We also need to insert the -force_load flag to force the linker to load the archive
         let mut args = rustc_args.link_args.clone();
+
         if let Some(last_object) = args.iter().rposition(|arg| arg.ends_with(".o")) {
             if archive_has_contents {
                 match self.linker_flavor() {
@@ -1497,13 +1490,15 @@ impl Server {
                     .current_dir(&self.crate_dir)
                     .arg("--message-format")
                     .arg("json-diagnostic-rendered-ansi")
+                    .arg("--color")
+                    .arg("always")
                     .args(self.cargo_build_arguments(mode))
                     .envs(self.cargo_build_env_vars(mode)?);
 
                 if mode == &BuildMode::Fat {
                     cmd.env(
                         rustc::DX_RUSTC_WRAPPER_ENV_VAR,
-                        dunce::canonicalize(self.rustc_wrapper_args_file.path())
+                        dunce::canonicalize(self.rustc_wrapper_args_file())
                             .unwrap()
                             .display()
                             .to_string(),
@@ -1699,8 +1694,8 @@ impl Server {
             link::LinkAction {
                 triple: self.triple.clone(),
                 linker: self.custom_linker.clone(),
-                link_err_file: dunce::canonicalize(self.link_err_file.path())?,
-                link_args_file: dunce::canonicalize(self.link_args_file.path())?,
+                link_err_file: dunce::canonicalize(self.link_err_file())?,
+                link_args_file: dunce::canonicalize(self.link_args_file())?,
             }
             .write_env_vars(&mut env_vars)?;
         }
@@ -1719,6 +1714,18 @@ impl Server {
         // }
 
         Ok(env_vars)
+    }
+
+    fn link_args_file(&self) -> PathBuf {
+        self.exe_dir().join("link_args.txt")
+    }
+
+    fn link_err_file(&self) -> PathBuf {
+        self.exe_dir().join("link_err.txt")
+    }
+
+    fn rustc_wrapper_args_file(&self) -> PathBuf {
+        self.exe_dir().join("rustc_wrapper_args.txt")
     }
 }
 

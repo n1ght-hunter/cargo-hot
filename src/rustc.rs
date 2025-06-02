@@ -48,19 +48,34 @@ pub async fn run_rustc() {
         .expect("DX_RUSTC not set")
         .into();
 
-    let rustc_args = Args {
+    let mut rustc_args = Args {
         args: args().skip(1).collect::<Vec<_>>(),
         envs: vars().collect::<_>(),
         link_args: Default::default(),
     };
 
-    std::fs::create_dir_all(var_file.parent().expect("Failed to get parent dir"))
-        .expect("Failed to create parent dir");
-    std::fs::write(
-        &var_file,
-        serde_json::to_string(&rustc_args).expect("Failed to serialize rustc args"),
-    )
-    .expect("Failed to write rustc args to file");
+    // A terrible hack to avoid writing non-sensical args when
+    // a build is completely fresh.
+    if rustc_args
+        .args
+        .iter()
+        .skip_while(|arg| *arg != "--crate-name")
+        .skip(1)
+        .next()
+        .is_some_and(|name| name != "___")
+    {
+        rustc_args
+            .envs
+            .retain_mut(|(key, _)| key != "CARGO_MAKEFLAGS");
+
+        std::fs::create_dir_all(var_file.parent().expect("Failed to get parent dir"))
+            .expect("Failed to create parent dir");
+        std::fs::write(
+            &var_file,
+            serde_json::to_string(&rustc_args).expect("Failed to serialize rustc args"),
+        )
+        .expect("Failed to write rustc args to file");
+    }
 
     // Run the actual rustc command
     // We want all stdout/stderr to be inherited, so the running process can see the output

@@ -416,6 +416,7 @@ dependencies = [
  "bincode",
  "cargo",
  "cargo-config2",
+ "cargo-hot-protocol",
  "cargo_metadata",
  "clap",
  "color-print",
@@ -439,6 +440,17 @@ dependencies = [
  "walrus",
  "wasmparser 0.232.0",
  "which",
+]
+
+[[package]]
+name = "cargo-hot-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "subsecond",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -919,7 +931,7 @@ dependencies = [
 name = "example"
 version = "0.1.0"
 dependencies = [
- "cargo-hot",
+ "cargo-hot-protocol",
  "subsecond",
 ]
 
